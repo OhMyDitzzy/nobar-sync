@@ -16,6 +16,7 @@ const S = {
   controlTimer: null,
   hostDuration: 0,
   viewerStream: null,
+  hostEnded: false,
 };
 
 const video = document.getElementById('video-player');
@@ -408,10 +409,11 @@ function handleHostData(data) {
       break;
     case 'play':
       S.isSyncing = true;
-      if (video.ended && S.viewerStream) {
-        // Reassign stored stream to unstick the ended state
+      if (S.hostEnded && S.viewerStream) {
+        // Host ended and is replaying — reassign srcObject to unstick the viewer
         video.srcObject = null;
         video.srcObject = S.viewerStream;
+        S.hostEnded = false;
       }
       video.play().finally(() => S.isSyncing = false);
       break;
@@ -419,6 +421,11 @@ function handleHostData(data) {
       S.isSyncing = true;
       video.pause();
       S.isSyncing = false;
+      break;
+    case 'ended':
+      S.hostEnded = true;
+      document.getElementById('btn-play-pause').textContent = '▶';
+      document.getElementById('center-play').textContent = '▶';
       break;
     case 'seek':
       // srcObject (live stream) does not support seeking; viewer just follows play/pause
@@ -493,6 +500,14 @@ function setupVideoEvents() {
       broadcastData({ type: 'pause', time: video.currentTime });
     } else if (!S.isHost && S.allowViewerControl && !S.isSyncing && S.hostDataConn?.open) {
       S.hostDataConn.send({ type: 'pause', time: video.currentTime });
+    }
+  });
+
+  video.addEventListener('ended', () => {
+    document.getElementById('btn-play-pause').textContent = '▶';
+    document.getElementById('center-play').textContent = '▶';
+    if (S.isHost) {
+      broadcastData({ type: 'ended' });
     }
   });
 
