@@ -404,18 +404,26 @@ function handleHostData(data) {
 
     case 'file-end': {
       const blob = new Blob(S.rxChunks, { type: S.fileMime });
-      const url = URL.createObjectURL(blob);
-      // We need currentTime/paused from the host — request a sync
-      S.hostDataConn.send({ type: 'request-sync' });
-      video.src = url;
+      const blobUrl = URL.createObjectURL(blob);
+      video.src = blobUrl;
       video.load();
-      video.addEventListener('canplay', () => {
-        hideConnecting();
-        showScreen('watch');
-        setupWatchUI(false);
-        updateControlsAccess();
+
+      hideConnecting();
+      showScreen('watch');
+      setupWatchUI(false);
+      updateControlsAccess();
+
+      function onFileReady() {
         document.getElementById('video-placeholder').style.display = 'none';
-      }, { once: true });
+        S.hostDataConn.send({ type: 'request-sync' });
+      }
+
+      if (video.readyState >= 3) {
+        onFileReady();
+      } else {
+        video.addEventListener('canplay', onFileReady, { once: true });
+        video.addEventListener('loadeddata', onFileReady, { once: true });
+      }
       break;
     }
 
@@ -430,6 +438,7 @@ function handleHostData(data) {
       break;
 
     case 'play':
+      document.getElementById('video-placeholder').style.display = 'none';
       S.isSyncing = true;
       video.currentTime = data.time;
       video.play().finally(() => S.isSyncing = false);
@@ -497,17 +506,29 @@ function handleViewerSync(conn) {
 function viewerLoadUrl(url, currentTime, paused) {
   video.src = url;
   video.load();
-  video.addEventListener('canplay', () => {
-    hideConnecting();
-    showScreen('watch');
-    setupWatchUI(false);
-    updateControlsAccess();
+
+  // Go to watch screen immediately — don't wait for canplay
+  // because host may send play/pause before it fires
+  hideConnecting();
+  showScreen('watch');
+  setupWatchUI(false);
+  updateControlsAccess();
+
+  function onReady() {
     document.getElementById('video-placeholder').style.display = 'none';
     S.isSyncing = true;
     video.currentTime = currentTime || 0;
     S.isSyncing = false;
     if (!paused) video.play().catch(() => {});
-  }, { once: true });
+  }
+
+  // Fire as soon as we have enough data; fall back to loadeddata
+  if (video.readyState >= 3) {
+    onReady();
+  } else {
+    video.addEventListener('canplay', onReady, { once: true });
+    video.addEventListener('loadeddata', onReady, { once: true });
+  }
 }
 
 // ── WATCH SCREEN SETUP ───────────────────────
