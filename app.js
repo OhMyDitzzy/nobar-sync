@@ -14,6 +14,7 @@ const S = {
   pendingModalFile: null,
   modalTab: 'url',
   controlTimer: null,
+  hostDuration: 0, // viewer uses this since srcObject has no duration
 };
 
 const video = document.getElementById('video-player');
@@ -334,6 +335,8 @@ function joinRoom() {
 
       S.hostMediaConn.on('stream', (stream) => {
         video.srcObject = stream;
+        video.muted = false;
+        video.volume = 1;
         video.play().catch(() => {
           document.getElementById('placeholder-txt').textContent = 'Tap untuk mulai putar ▶';
           document.getElementById('video-placeholder').style.display = 'flex';
@@ -392,20 +395,30 @@ function handleHostData(data) {
         S.isSyncing = false;
       }
       break;
+    case 'duration':
+      S.hostDuration = data.duration;
+      break;
     case 'play':
       S.isSyncing = true;
-      video.currentTime = data.time;
+      // srcObject is a live stream, currentTime is read-only — skip seek for viewer
+      if (!video.srcObject) video.currentTime = data.time;
+      // If video ended, reset srcObject so the element can play again
+      if (video.ended && video.srcObject) {
+        const stream = video.srcObject;
+        video.srcObject = null;
+        video.srcObject = stream;
+      }
       video.play().finally(() => S.isSyncing = false);
       break;
     case 'pause':
       S.isSyncing = true;
-      video.currentTime = data.time;
+      if (!video.srcObject) video.currentTime = data.time;
       video.pause();
       S.isSyncing = false;
       break;
     case 'seek':
       S.isSyncing = true;
-      video.currentTime = data.time;
+      if (!video.srcObject) video.currentTime = data.time;
       S.isSyncing = false;
       break;
     case 'chat':
@@ -482,17 +495,23 @@ function setupVideoEvents() {
   });
 
   video.addEventListener('timeupdate', () => {
-    const pct = video.duration ? (video.currentTime / video.duration) * 100 : 0;
+    // Viewer gets duration from host via data channel; srcObject has no real duration
+    const dur = S.isHost ? video.duration : S.hostDuration;
+    const pct = dur && isFinite(dur) ? (video.currentTime / dur) * 100 : 0;
     const sb = document.getElementById('seek-bar');
     sb.value = pct;
     sb.style.background = `linear-gradient(to right, var(--gold) ${pct}%, rgba(255,255,255,.2) ${pct}%)`;
     document.getElementById('time-display').textContent =
-      fmtTime(video.currentTime) + ' / ' + fmtTime(video.duration);
+      fmtTime(video.currentTime) + ' / ' + fmtTime(dur);
   });
 
   video.addEventListener('loadedmetadata', () => {
     document.getElementById('video-placeholder').style.display = 'none';
     document.getElementById('seek-bar').max = 100;
+    // Host broadcasts duration so viewer can display it correctly
+    if (S.isHost && isFinite(video.duration)) {
+      broadcastData({ type: 'duration', duration: video.duration });
+    }
   });
 
   let seekTimer;
@@ -534,9 +553,10 @@ function skip(sec) {
 
 function onSeekInput(val) {
   if (!S.isHost && !S.allowViewerControl) return;
-  const t = (val / 100) * (video.duration || 0);
+  const dur = S.isHost ? video.duration : S.hostDuration;
+  const t = (val / 100) * (dur || 0);
   document.getElementById('time-display').textContent =
-    fmtTime(t) + ' / ' + fmtTime(video.duration);
+    fmtTime(t) + ' / ' + fmtTime(dur);
 }
 
 function onSeekChange(val) {
@@ -544,7 +564,8 @@ function onSeekChange(val) {
     showToast('🔒 Kontrol dikunci oleh host');
     return;
   }
-  const t = (val / 100) * (video.duration || 0);
+  const dur = S.isHost ? video.duration : S.hostDuration;
+  const t = (val / 100) * (dur || 0);
   S.isSyncing = true;
   video.currentTime = t;
   S.isSyncing = false;
