@@ -277,8 +277,10 @@ function handleViewerData(conn, data) {
       if (S.allowViewerControl) {
         S.isSyncing = true;
         video.currentTime = data.time;
-        video.play().finally(() => S.isSyncing = false);
         broadcastData({ type: 'play', time: data.time }, conn);
+        video.play().catch(() => {});
+        // Clear isSyncing after 'play' event has fired (event listener runs before ours)
+        video.addEventListener('play', () => { S.isSyncing = false; }, { once: true });
       }
       break;
     case 'pause':
@@ -286,16 +288,16 @@ function handleViewerData(conn, data) {
         S.isSyncing = true;
         video.currentTime = data.time;
         video.pause();
-        S.isSyncing = false;
         broadcastData({ type: 'pause', time: data.time }, conn);
+        video.addEventListener('pause', () => { S.isSyncing = false; }, { once: true });
       }
       break;
     case 'seek':
       if (S.allowViewerControl) {
         S.isSyncing = true;
         video.currentTime = data.time;
-        S.isSyncing = false;
         broadcastData({ type: 'seek', time: data.time }, conn);
+        video.addEventListener('seeked', () => { S.isSyncing = false; }, { once: true });
       }
       break;
   }
@@ -428,12 +430,13 @@ function handleHostData(data) {
     }
 
     case 'sync':
-      // Host responds to request-sync with current playback state
       S.isSyncing = true;
       video.currentTime = data.currentTime;
-      S.isSyncing = false;
       if (!data.paused) {
         video.play().catch(() => {});
+        video.addEventListener('play', () => { S.isSyncing = false; }, { once: true });
+      } else {
+        video.addEventListener('seeked', () => { S.isSyncing = false; }, { once: true });
       }
       break;
 
@@ -441,20 +444,21 @@ function handleHostData(data) {
       document.getElementById('video-placeholder').style.display = 'none';
       S.isSyncing = true;
       video.currentTime = data.time;
-      video.play().finally(() => S.isSyncing = false);
+      video.play().catch(() => {});
+      video.addEventListener('play', () => { S.isSyncing = false; }, { once: true });
       break;
 
     case 'pause':
       S.isSyncing = true;
       video.currentTime = data.time;
       video.pause();
-      S.isSyncing = false;
+      video.addEventListener('pause', () => { S.isSyncing = false; }, { once: true });
       break;
 
     case 'seek':
       S.isSyncing = true;
       video.currentTime = data.time;
-      S.isSyncing = false;
+      video.addEventListener('seeked', () => { S.isSyncing = false; }, { once: true });
       break;
 
     case 'ended':
@@ -518,8 +522,12 @@ function viewerLoadUrl(url, currentTime, paused) {
     document.getElementById('video-placeholder').style.display = 'none';
     S.isSyncing = true;
     video.currentTime = currentTime || 0;
-    S.isSyncing = false;
-    if (!paused) video.play().catch(() => {});
+    if (!paused) {
+      video.play().catch(() => {});
+      video.addEventListener('play', () => { S.isSyncing = false; }, { once: true });
+    } else {
+      video.addEventListener('seeked', () => { S.isSyncing = false; }, { once: true });
+    }
   }
 
   // Fire as soon as we have enough data; fall back to loadeddata
