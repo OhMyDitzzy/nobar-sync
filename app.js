@@ -5,21 +5,26 @@ const S = {
   roomCode: null,
   allowViewerControl: false,
   connections: [],
-  activeCalls: [],
   hostDataConn: null,
-  hostMediaConn: null,
-  videoStream: null,
   isSyncing: false,
   pendingFile: null,
   pendingModalFile: null,
   modalTab: 'url',
   controlTimer: null,
-  hostDuration: 0,
-  viewerStream: null,
-  hostEnded: false,
+  // video source (host stores these to send to late-joining viewers)
+  videoKind: null,   // 'url' | 'file'
+  videoUrl: null,
+  fileBuffer: null,
+  fileMime: '',
+  fileName: '',
+  // viewer file reception
+  rxChunks: [],
+  rxTotal: 0,
+  rxReceived: 0,
 };
 
 const video = document.getElementById('video-player');
+const CHUNK_SIZE = 65536; // 64 KB per chunk
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-file-input').addEventListener('change', (e) => {
@@ -34,19 +39,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.target === e.currentTarget) closeModal();
   });
 
-  // Drag & drop on setup file zone
   const setupZone = document.getElementById('setup-file-zone');
   ['dragover', 'dragenter'].forEach(ev =>
-    setupZone.addEventListener(ev, e => {
-      e.preventDefault();
-      setupZone.classList.add('drag-over');
-    })
+    setupZone.addEventListener(ev, e => { e.preventDefault(); setupZone.classList.add('drag-over'); })
   );
   ['dragleave', 'dragend', 'drop'].forEach(ev =>
-    setupZone.addEventListener(ev, e => {
-      e.preventDefault();
-      setupZone.classList.remove('drag-over');
-    })
+    setupZone.addEventListener(ev, e => { e.preventDefault(); setupZone.classList.remove('drag-over'); })
   );
   setupZone.addEventListener('drop', e => handleSetupFile(e.dataTransfer.files[0]));
 });
@@ -62,7 +60,7 @@ function genCode() {
 }
 
 function fmtTime(s) {
-  if (isNaN(s)) return '0:00';
+  if (!s || isNaN(s) || !isFinite(s)) return '0:00';
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${sec.toString().padStart(2, '0')}`;
@@ -88,9 +86,7 @@ function hideConnecting() {
 
 function copyCode() {
   if (!S.roomCode) return;
-  navigator.clipboard?.writeText(S.roomCode).then(() =>
-    showToast('📋 Kode disalin: ' + S.roomCode)
-  );
+  navigator.clipboard?.writeText(S.roomCode).then(() => showToast('📋 Kode disalin: ' + S.roomCode));
 }
 
 function updateViewerBadge(n) {
@@ -110,6 +106,8 @@ function handleSetupFile(file) {
   S.pendingFile = file;
   document.getElementById('setup-file-name').textContent = '✔ ' + file.name;
 }
+
+// ── HOST: CREATE ROOM ────────────────────────
 
 function createRoom() {
   const name = document.getElementById('host-name').value.trim() || 'Host';
@@ -137,7 +135,6 @@ function initHostPeer(code, urlVal, hasFile) {
 
   S.peer.on('open', async (id) => {
     S.roomCode = id;
-    hideConnecting();
 
     if (hasFile && S.pendingFile) {
       await hostLoadFile(S.pendingFile);
@@ -145,6 +142,7 @@ function initHostPeer(code, urlVal, hasFile) {
       await hostLoadUrl(urlVal);
     }
 
+    hideConnecting();
     showScreen('watch');
     setupWatchUI(true);
   });
@@ -152,38 +150,36 @@ function initHostPeer(code, urlVal, hasFile) {
   S.peer.on('error', (err) => {
     hideConnecting();
     if (err.type === 'unavailable-id') {
-      initHostPeer(genCode(), urlVal, hasFile); // retry with new code
+      initHostPeer(genCode(), urlVal, hasFile);
     } else {
       showToast('❌ Error: ' + err.message);
     }
   });
 
   S.peer.on('connection', (conn) => handleNewViewer(conn));
-
-  S.peer.on('call', (call) => {
-    const stream = S.videoStream || new MediaStream();
-    call.answer(stream);
-    S.activeCalls.push(call);
-    call.on('close', () => { S.activeCalls = S.activeCalls.filter(c => c !== call); });
-    call.on('error', () => { S.activeCalls = S.activeCalls.filter(c => c !== call); });
-  });
 }
 
 async function hostLoadFile(file) {
-  const url = URL.createObjectURL(file);
-  video.src = url;
+  showConnecting('Membaca file...');
+  S.videoKind = 'file';
+  S.fileMime = file.type || 'video/mp4';
+  S.fileName = file.name;
+  S.fileBuffer = await file.arrayBuffer();
+
+  const blob = new Blob([S.fileBuffer], { type: S.fileMime });
+  video.src = URL.createObjectURL(blob);
   video.srcObject = null;
   await waitForMetadata();
-  captureHostStream();
   document.getElementById('video-placeholder').style.display = 'none';
 }
 
 async function hostLoadUrl(url) {
+  S.videoKind = 'url';
+  S.videoUrl = url;
   video.src = url;
   video.srcObject = null;
   video.load();
   await waitForMetadata().catch(() => {});
-  captureHostStream();
   document.getElementById('video-placeholder').style.display = 'none';
 }
 
@@ -198,48 +194,33 @@ function waitForMetadata() {
     };
     video.addEventListener('loadedmetadata', ok);
     video.addEventListener('error', err);
-    setTimeout(res, 4000); // fallback timeout
+    setTimeout(res, 5000);
   });
 }
 
-function captureHostStream() {
-  if (!video.captureStream && !video.mozCaptureStream) return;
-  try {
-    S.videoStream = (video.captureStream || video.mozCaptureStream).call(video);
-  } catch (e) {
-    console.warn('captureStream failed:', e);
-  }
-}
-
-async function replaceStreamTracks() {
-  if (!S.videoStream) return;
-  for (const call of S.activeCalls) {
-    try {
-      const senders = call.peerConnection?.getSenders() || [];
-      for (const sender of senders) {
-        if (!sender.track) continue;
-        const newTrack = S.videoStream.getTracks().find(t => t.kind === sender.track.kind);
-        if (newTrack) await sender.replaceTrack(newTrack);
-      }
-      if (senders.length === 0) {
-        S.videoStream.getTracks().forEach(t => call.peerConnection?.addTrack(t, S.videoStream));
-      }
-    } catch (e) { console.warn('replaceTrack:', e); }
-  }
-}
+// ── HOST: VIEWER MANAGEMENT ──────────────────
 
 function handleNewViewer(conn) {
   S.connections.push(conn);
-  updateViewerBadge(S.connections.length);
 
   conn.on('open', () => {
+    // Send initial state
     conn.send({
       type: 'init',
       allowViewerControl: S.allowViewerControl,
       roomCode: S.roomCode,
       currentTime: video.currentTime,
       paused: video.paused,
+      videoKind: S.videoKind,
+      videoUrl: S.videoKind === 'url' ? S.videoUrl : null,
+      fileMime: S.fileMime,
+      fileName: S.fileName,
     });
+
+    // If file-based, transfer the file to this viewer
+    if (S.videoKind === 'file' && S.fileBuffer) {
+      sendFileTo(conn);
+    }
 
     const name = conn.metadata?.name || 'Penonton';
     const sysMsg = `${name} bergabung 👋`;
@@ -254,15 +235,33 @@ function handleNewViewer(conn) {
     S.connections = S.connections.filter(c => c !== conn);
     updateViewerBadge(S.connections.length);
     const name = conn.metadata?.name || 'Penonton';
-    const sysMsg = `${name} keluar`;
-    broadcastData({ type: 'sys', msg: sysMsg });
-    addSysMsg(sysMsg);
+    const msg = `${name} keluar`;
+    broadcastData({ type: 'sys', msg });
+    addSysMsg(msg);
   });
 
   conn.on('error', () => {
     S.connections = S.connections.filter(c => c !== conn);
     updateViewerBadge(S.connections.length);
   });
+}
+
+// Send file in chunks to a specific connection
+async function sendFileTo(conn) {
+  const buf = S.fileBuffer;
+  const total = Math.ceil(buf.byteLength / CHUNK_SIZE);
+
+  conn.send({ type: 'file-start', total, mime: S.fileMime, name: S.fileName });
+
+  for (let i = 0; i < total; i++) {
+    if (!conn.open) break;
+    const chunk = buf.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+    conn.send({ type: 'file-chunk', index: i, data: chunk });
+    // Yield every 20 chunks to avoid overwhelming the data channel
+    if (i % 20 === 19) await new Promise(r => setTimeout(r, 15));
+  }
+
+  conn.send({ type: 'file-end' });
 }
 
 function handleViewerData(conn, data) {
@@ -307,6 +306,8 @@ function broadcastData(data, exclude = null) {
   });
 }
 
+// ── VIEWER: JOIN ROOM ────────────────────────
+
 function joinRoom() {
   const name = document.getElementById('viewer-name').value.trim() || 'Penonton';
   const code = document.getElementById('room-code-input').value.trim().toUpperCase();
@@ -328,43 +329,11 @@ function joinRoom() {
     S.hostDataConn = S.peer.connect(code, { metadata: { name }, reliable: true });
 
     S.hostDataConn.on('open', () => {
-      // Build a dummy stream that includes a silent audio track so WebRTC
-      // negotiates both video AND audio tracks with the host.
-      const canvas = document.createElement('canvas');
-      canvas.width = 2; canvas.height = 2;
-      const emptyStream = canvas.captureStream ? canvas.captureStream() : new MediaStream();
-      try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const dest = audioCtx.createMediaStreamDestination();
-        dest.stream.getAudioTracks().forEach(t => emptyStream.addTrack(t));
-      } catch (e) { /* ignore if AudioContext unavailable */ }
-
-      S.hostMediaConn = S.peer.call(code, emptyStream);
-
-      S.hostMediaConn.on('stream', (stream) => {
-        S.viewerStream = stream;
-        video.srcObject = stream;
-        video.muted = false;
-        video.volume = 1;
-        video.play().catch(() => {
-          document.getElementById('placeholder-txt').textContent = 'Tap untuk mulai putar ▶';
-          document.getElementById('video-placeholder').style.display = 'flex';
-          document.getElementById('video-placeholder').onclick = () => {
-            video.play();
-            document.getElementById('video-placeholder').style.display = 'none';
-            document.getElementById('video-placeholder').onclick = null;
-          };
-        });
-        document.getElementById('video-placeholder').style.display = 'none';
-        hideConnecting();
-        showScreen('watch');
-        setupWatchUI(false);
-      });
-
-      S.hostMediaConn.on('error', (e) => showToast('Media error: ' + e));
+      // Connection open, waiting for 'init' from host
     });
 
     S.hostDataConn.on('data', handleHostData);
+
     S.hostDataConn.on('close', () => showToast('❌ Host memutus koneksi'));
     S.hostDataConn.on('error', (e) => {
       hideConnecting();
@@ -372,12 +341,13 @@ function joinRoom() {
     });
 
     setTimeout(() => {
-      if (!video.srcObject) {
+      if (document.getElementById('screen-watch').style.display === 'none' ||
+          !document.getElementById('screen-watch').classList.contains('active')) {
         hideConnecting();
         showToast('⏱ Timeout. Periksa kode room.');
         showScreen('join');
       }
-    }, 15000);
+    }, 20000);
   });
 
   S.peer.on('error', (err) => {
@@ -391,51 +361,102 @@ function joinRoom() {
   });
 }
 
+// ── VIEWER: HANDLE HOST DATA ─────────────────
+
 function handleHostData(data) {
   switch (data.type) {
     case 'init':
       S.allowViewerControl = data.allowViewerControl;
       S.roomCode = data.roomCode;
       document.getElementById('topbar-code').textContent = data.roomCode || '------';
-      updateControlsAccess();
-      if (Math.abs(video.currentTime - data.currentTime) > 2) {
-        S.isSyncing = true;
-        video.currentTime = data.currentTime;
-        S.isSyncing = false;
+
+      if (data.videoKind === 'url') {
+        // Load URL directly — same as host
+        viewerLoadUrl(data.videoUrl, data.currentTime, data.paused);
+      } else if (data.videoKind === 'file') {
+        // File will arrive via file-start/chunk/end messages
+        showConnecting('Menerima video dari host...');
+        S.rxChunks = [];
+        S.rxTotal = 0;
+        S.rxReceived = 0;
       }
       break;
-    case 'duration':
-      S.hostDuration = data.duration;
+
+    case 'file-start':
+      S.rxChunks = new Array(data.total);
+      S.rxTotal = data.total;
+      S.rxReceived = 0;
+      S.fileMime = data.mime;
+      document.getElementById('connecting-txt').textContent =
+        `Menerima video... 0%`;
       break;
+
+    case 'file-chunk':
+      S.rxChunks[data.index] = data.data;
+      S.rxReceived++;
+      const pct = Math.round((S.rxReceived / S.rxTotal) * 100);
+      document.getElementById('connecting-txt').textContent =
+        `Menerima video... ${pct}%`;
+      break;
+
+    case 'file-end': {
+      const blob = new Blob(S.rxChunks, { type: S.fileMime });
+      const url = URL.createObjectURL(blob);
+      // We need currentTime/paused from the host — request a sync
+      S.hostDataConn.send({ type: 'request-sync' });
+      video.src = url;
+      video.load();
+      video.addEventListener('canplay', () => {
+        hideConnecting();
+        showScreen('watch');
+        setupWatchUI(false);
+        updateControlsAccess();
+      }, { once: true });
+      break;
+    }
+
+    case 'sync':
+      // Host responds to request-sync with current playback state
+      S.isSyncing = true;
+      video.currentTime = data.currentTime;
+      S.isSyncing = false;
+      if (!data.paused) {
+        video.play().catch(() => {});
+      }
+      break;
+
     case 'play':
       S.isSyncing = true;
-      if (S.hostEnded && S.viewerStream) {
-        // Host ended and is replaying — reassign srcObject to unstick the viewer
-        video.srcObject = null;
-        video.srcObject = S.viewerStream;
-        S.hostEnded = false;
-      }
+      video.currentTime = data.time;
       video.play().finally(() => S.isSyncing = false);
       break;
+
     case 'pause':
       S.isSyncing = true;
+      video.currentTime = data.time;
       video.pause();
       S.isSyncing = false;
       break;
+
+    case 'seek':
+      S.isSyncing = true;
+      video.currentTime = data.time;
+      S.isSyncing = false;
+      break;
+
     case 'ended':
-      S.hostEnded = true;
       document.getElementById('btn-play-pause').textContent = '▶';
       document.getElementById('center-play').textContent = '▶';
       break;
-    case 'seek':
-      // srcObject (live stream) does not support seeking; viewer just follows play/pause
-      break;
+
     case 'chat':
       addChatMsg({ name: data.name, text: data.text, mine: false, isHost: data.isHost });
       break;
+
     case 'sys':
       addSysMsg(data.msg);
       break;
+
     case 'config-update':
       S.allowViewerControl = data.allowViewerControl;
       updateControlsAccess();
@@ -444,12 +465,47 @@ function handleHostData(data) {
         : '🔒 Kontrol dikunci ke host saja'
       );
       break;
-    case 'video-reload':
+
+    case 'video-change':
+      // Host changed the video entirely
       addSysMsg('🎬 Host mengganti video...');
-      document.getElementById('video-placeholder').style.display = 'none';
+      if (data.videoKind === 'url') {
+        viewerLoadUrl(data.videoUrl, 0, true);
+      } else {
+        showConnecting('Menerima video baru...');
+        S.rxChunks = [];
+        S.rxTotal = 0;
+        S.rxReceived = 0;
+      }
       break;
   }
 }
+
+// Host responds to viewer's request-sync
+function handleViewerSync(conn) {
+  conn.send({
+    type: 'sync',
+    currentTime: video.currentTime,
+    paused: video.paused,
+  });
+}
+
+function viewerLoadUrl(url, currentTime, paused) {
+  video.src = url;
+  video.load();
+  video.addEventListener('canplay', () => {
+    hideConnecting();
+    showScreen('watch');
+    setupWatchUI(false);
+    updateControlsAccess();
+    S.isSyncing = true;
+    video.currentTime = currentTime || 0;
+    S.isSyncing = false;
+    if (!paused) video.play().catch(() => {});
+  }, { once: true });
+}
+
+// ── WATCH SCREEN SETUP ───────────────────────
 
 function setupWatchUI(isHost) {
   document.getElementById('topbar-code').textContent = S.roomCode || '------';
@@ -482,6 +538,8 @@ function updateViewerControlLive() {
   updateControlsAccess();
 }
 
+// ── VIDEO EVENTS ─────────────────────────────
+
 function setupVideoEvents() {
   video.addEventListener('play', () => {
     document.getElementById('btn-play-pause').textContent = '⏸';
@@ -506,14 +564,11 @@ function setupVideoEvents() {
   video.addEventListener('ended', () => {
     document.getElementById('btn-play-pause').textContent = '▶';
     document.getElementById('center-play').textContent = '▶';
-    if (S.isHost) {
-      broadcastData({ type: 'ended' });
-    }
+    if (S.isHost) broadcastData({ type: 'ended' });
   });
 
   video.addEventListener('timeupdate', () => {
-    // Viewer gets duration from host via data channel; srcObject has no real duration
-    const dur = S.isHost ? video.duration : S.hostDuration;
+    const dur = video.duration;
     const pct = dur && isFinite(dur) ? (video.currentTime / dur) * 100 : 0;
     const sb = document.getElementById('seek-bar');
     sb.value = pct;
@@ -525,32 +580,19 @@ function setupVideoEvents() {
   video.addEventListener('loadedmetadata', () => {
     document.getElementById('video-placeholder').style.display = 'none';
     document.getElementById('seek-bar').max = 100;
-    // Host broadcasts duration so viewer can display it correctly
-    if (S.isHost && isFinite(video.duration)) {
-      broadcastData({ type: 'duration', duration: video.duration });
-    }
   });
 
   let seekTimer;
   video.addEventListener('seeking', () => {
-    if (!S.isSyncing && S.isHost) {
+    if (S.isSyncing) return;
+    if (S.isHost) {
       clearTimeout(seekTimer);
-      seekTimer = setTimeout(() => {
-        broadcastData({ type: 'seek', time: video.currentTime });
-      }, 250);
+      seekTimer = setTimeout(() => broadcastData({ type: 'seek', time: video.currentTime }), 250);
+    } else if (S.allowViewerControl && S.hostDataConn?.open) {
+      clearTimeout(seekTimer);
+      seekTimer = setTimeout(() => S.hostDataConn.send({ type: 'seek', time: video.currentTime }), 300);
     }
   });
-
-  if (!S.isHost) {
-    video.addEventListener('seeking', () => {
-      if (!S.isSyncing && S.allowViewerControl && S.hostDataConn?.open) {
-        clearTimeout(seekTimer);
-        seekTimer = setTimeout(() => {
-          S.hostDataConn.send({ type: 'seek', time: video.currentTime });
-        }, 300);
-      }
-    });
-  }
 }
 
 function togglePlayPause() {
@@ -570,10 +612,9 @@ function skip(sec) {
 
 function onSeekInput(val) {
   if (!S.isHost && !S.allowViewerControl) return;
-  const dur = S.isHost ? video.duration : S.hostDuration;
-  const t = (val / 100) * (dur || 0);
+  const t = (val / 100) * (video.duration || 0);
   document.getElementById('time-display').textContent =
-    fmtTime(t) + ' / ' + fmtTime(dur);
+    fmtTime(t) + ' / ' + fmtTime(video.duration);
 }
 
 function onSeekChange(val) {
@@ -581,8 +622,7 @@ function onSeekChange(val) {
     showToast('🔒 Kontrol dikunci oleh host');
     return;
   }
-  const dur = S.isHost ? video.duration : S.hostDuration;
-  const t = (val / 100) * (dur || 0);
+  const t = (val / 100) * (video.duration || 0);
   S.isSyncing = true;
   video.currentTime = t;
   S.isSyncing = false;
@@ -624,14 +664,14 @@ function handleTouchEnd() {
   if (Date.now() - touchStartTime < 250) showControlsFor(3000);
 }
 
+// ── CHAT ─────────────────────────────────────
+
 function sendChat() {
   const inp = document.getElementById('chat-input');
   const text = inp.value.trim();
   if (!text) return;
   inp.value = '';
-
   addChatMsg({ name: S.myName, text, mine: true, isHost: S.isHost });
-
   if (S.isHost) {
     broadcastData({ type: 'chat', name: S.myName, text, isHost: true });
   } else if (S.hostDataConn?.open) {
@@ -662,16 +702,16 @@ function addSysMsg(text) {
 
 function esc(s) {
   return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function toggleChat() {
   const chat = document.getElementById('chat-side');
   chat.style.display = chat.style.display === 'none' ? '' : 'none';
 }
+
+// ── CHANGE VIDEO MODAL (HOST) ────────────────
 
 function openChangeVideoModal() {
   document.getElementById('modal-change-video').classList.remove('hidden');
@@ -701,19 +741,30 @@ async function applyVideoChange() {
     const url = document.getElementById('modal-video-url').value.trim();
     if (!url) { showToast('⚠️ Masukkan URL video'); return; }
     await hostLoadUrl(url);
+    broadcastData({ type: 'video-change', videoKind: 'url', videoUrl: url });
   } else if (S.pendingModalFile) {
     await hostLoadFile(S.pendingModalFile);
     S.pendingModalFile = null;
+    // Send new file to all connected viewers
+    broadcastData({ type: 'video-change', videoKind: 'file' });
+    for (const conn of S.connections) {
+      if (conn.open) sendFileTo(conn);
+    }
   } else {
     showToast('⚠️ Pilih file terlebih dahulu');
     return;
   }
 
-  broadcastData({ type: 'video-reload' });
+  showToast('✅ Video berhasil diganti');
+}
 
-  setTimeout(async () => {
-    captureHostStream();
-    await replaceStreamTracks();
-    showToast('✅ Video berhasil diganti');
-  }, 800);
+// Host handles viewer's request-sync
+// Hooked into the data handler
+const _origHandleViewerData = handleViewerData;
+function handleViewerData(conn, data) {
+  if (data.type === 'request-sync') {
+    handleViewerSync(conn);
+    return;
+  }
+  _origHandleViewerData(conn, data);
 }
