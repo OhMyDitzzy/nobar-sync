@@ -14,7 +14,8 @@ const S = {
   pendingModalFile: null,
   modalTab: 'url',
   controlTimer: null,
-  hostDuration: 0, // viewer uses this since srcObject has no duration
+  hostDuration: 0,
+  viewerStream: null,
 };
 
 const video = document.getElementById('video-player');
@@ -326,14 +327,21 @@ function joinRoom() {
     S.hostDataConn = S.peer.connect(code, { metadata: { name }, reliable: true });
 
     S.hostDataConn.on('open', () => {
-      // Need a dummy stream to initiate the call
+      // Build a dummy stream that includes a silent audio track so WebRTC
+      // negotiates both video AND audio tracks with the host.
       const canvas = document.createElement('canvas');
       canvas.width = 2; canvas.height = 2;
       const emptyStream = canvas.captureStream ? canvas.captureStream() : new MediaStream();
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const dest = audioCtx.createMediaStreamDestination();
+        dest.stream.getAudioTracks().forEach(t => emptyStream.addTrack(t));
+      } catch (e) { /* ignore if AudioContext unavailable */ }
 
       S.hostMediaConn = S.peer.call(code, emptyStream);
 
       S.hostMediaConn.on('stream', (stream) => {
+        S.viewerStream = stream;
         video.srcObject = stream;
         video.muted = false;
         video.volume = 1;
@@ -400,26 +408,20 @@ function handleHostData(data) {
       break;
     case 'play':
       S.isSyncing = true;
-      // srcObject is a live stream, currentTime is read-only — skip seek for viewer
-      if (!video.srcObject) video.currentTime = data.time;
-      // If video ended, reset srcObject so the element can play again
-      if (video.ended && video.srcObject) {
-        const stream = video.srcObject;
+      if (video.ended && S.viewerStream) {
+        // Reassign stored stream to unstick the ended state
         video.srcObject = null;
-        video.srcObject = stream;
+        video.srcObject = S.viewerStream;
       }
       video.play().finally(() => S.isSyncing = false);
       break;
     case 'pause':
       S.isSyncing = true;
-      if (!video.srcObject) video.currentTime = data.time;
       video.pause();
       S.isSyncing = false;
       break;
     case 'seek':
-      S.isSyncing = true;
-      if (!video.srcObject) video.currentTime = data.time;
-      S.isSyncing = false;
+      // srcObject (live stream) does not support seeking; viewer just follows play/pause
       break;
     case 'chat':
       addChatMsg({ name: data.name, text: data.text, mine: false, isHost: data.isHost });
