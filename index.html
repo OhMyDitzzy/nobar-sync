@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>NobarSync — Nonton Bareng</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+<!-- Connecting overlay -->
+<div class="connecting hidden" id="connecting">
+  <div class="spinner-wrap">
+    <div class="spinner"></div>
+    <div class="spinner-inner"></div>
+  </div>
+  <div class="connecting-txt" id="connecting-txt">Menghubungkan...</div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<!-- Change Video Modal -->
+<div class="modal-bg hidden" id="modal-change-video">
+  <div class="modal">
+    <div class="modal-title">Ganti Video</div>
+    <div class="form-group">
+      <div class="source-tabs">
+        <button class="source-tab active" onclick="switchModalTab('url')">🔗 Link URL</button>
+        <button class="source-tab" onclick="switchModalTab('file')">📁 File Lokal</button>
+      </div>
+      <div class="source-panel active" id="modal-panel-url">
+        <input class="form-input" id="modal-video-url" type="url"
+          placeholder="https://example.com/video.mp4">
+      </div>
+      <div class="source-panel" id="modal-panel-file">
+        <input type="file" id="modal-file-input" accept="video/*">
+        <div class="file-zone" id="modal-file-zone"
+          onclick="document.getElementById('modal-file-input').click()">
+          <div class="fz-icon">📂</div>
+          <div class="fz-text">Tap untuk pilih file video</div>
+          <div class="fz-name" id="modal-file-name"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
+      <button class="btn btn-gold btn-sm" onclick="applyVideoChange()">Terapkan</button>
+    </div>
+  </div>
+</div>
+
+<div class="screen active" id="screen-home">
+  <div class="home-bg"></div>
+  <div class="home-content">
+
+    <div class="home-badge">
+      Nonton Bareng — Tanpa Server
+    </div>
+
+    <h1 class="home-title">Nobar<em>Sync</em></h1>
+
+    <div class="home-divider">
+      <span>P2P · REALTIME · PRIVATE</span>
+    </div>
+
+    <p class="home-sub">
+      Tonton video bersama teman secara real-time. Langsung P2P, tanpa server, tanpa login.
+    </p>
+
+    <div class="home-actions">
+      <button class="btn btn-gold" style="width:100%" onclick="showScreen('host-setup')">
+        🎬 Buat Room
+      </button>
+      <button class="btn btn-outline" style="width:100%" onclick="showScreen('join')">
+        🔑 Masukkan Kode Room
+      </button>
+    </div>
+
+    <div class="home-features">
+      <div class="home-feat">
+        <div class="feat-icon">⚡</div>
+        P2P Langsung
+      </div>
+      <div class="home-feat">
+        <div class="feat-icon">💬</div>
+        Live Chat
+      </div>
+      <div class="home-feat">
+        <div class="feat-icon">🔄</div>
+        Sync Otomatis
+      </div>
+      <div class="home-feat">
+        <div class="feat-icon">📁</div>
+        File Lokal
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="screen" id="screen-host-setup">
+  <div class="setup-outer">
+    <div class="setup-card">
+
+      <button class="setup-back" onclick="showScreen('home')">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10 3L5 8l5 5"/>
+        </svg>
+        Kembali
+      </button>
+
+      <div class="setup-eyebrow">Host</div>
+      <div class="setup-title">Buat Room</div>
+      <div class="setup-sub">Atur room dan pilih sumber video sebelum mulai menonton.</div>
+
+      <div class="form-group">
+        <label class="form-label" for="host-name">Nama Kamu</label>
+        <input class="form-input" id="host-name" type="text"
+          placeholder="Masukkan namamu..." maxlength="20">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Sumber Video</label>
+        <div class="source-tabs">
+          <button class="source-tab active" id="tab-url" onclick="switchSetupTab('url')">🔗 Link URL</button>
+          <button class="source-tab" id="tab-file" onclick="switchSetupTab('file')">📁 File Lokal</button>
+        </div>
+        <div class="source-panel active" id="setup-panel-url">
+          <input class="form-input" id="setup-video-url" type="url"
+            placeholder="https://example.com/video.mp4">
+          <div class="hint">Gunakan direct link ke file video (.mp4, .webm, dll)</div>
+        </div>
+        <div class="source-panel" id="setup-panel-file">
+          <input type="file" id="setup-file-input" accept="video/*"
+            onchange="handleSetupFile(this.files[0])">
+          <div class="file-zone" id="setup-file-zone"
+            onclick="document.getElementById('setup-file-input').click()">
+            <div class="fz-icon">📂</div>
+            <div class="fz-text">Tap atau drag file video ke sini</div>
+            <div class="fz-name" id="setup-file-name"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="toggle-row">
+        <div class="toggle-info">
+          <div class="tl">Izinkan Penonton Kontrol</div>
+          <div class="td">Penonton bisa play, pause, dan seek video</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="toggle-viewer-ctrl">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div style="height: 1.5rem"></div>
+      <button class="btn btn-gold" style="width:100%" onclick="createRoom()">
+        🚀 Mulai Room
+      </button>
+
+    </div>
+  </div>
+</div>
+
+<div class="screen" id="screen-join">
+  <div class="setup-outer">
+    <div class="setup-card">
+
+      <button class="setup-back" onclick="showScreen('home')">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10 3L5 8l5 5"/>
+        </svg>
+        Kembali
+      </button>
+
+      <div class="setup-eyebrow">Penonton</div>
+      <div class="setup-title">Masuk Room</div>
+      <div class="setup-sub">Minta kode room dari host, lalu masukkan di bawah untuk bergabung.</div>
+
+      <div class="form-group">
+        <label class="form-label" for="viewer-name">Nama Kamu</label>
+        <input class="form-input" id="viewer-name" type="text"
+          placeholder="Masukkan namamu..." maxlength="20">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="room-code-input">Kode Room</label>
+        <input class="form-input" id="room-code-input" type="text"
+          placeholder="AB3X7K"
+          maxlength="6"
+          style="font-family:'Space Mono',monospace;font-size:1.5rem;letter-spacing:.25em;text-align:center;text-transform:uppercase"
+          oninput="this.value=this.value.toUpperCase()">
+      </div>
+
+      <button class="btn btn-gold" style="width:100%;margin-top:.5rem" onclick="joinRoom()">
+        🎬 Masuk Room
+      </button>
+
+    </div>
+  </div>
+</div>
+
+<div class="screen" id="screen-watch">
+
+  <!-- Top bar -->
+  <div class="watch-topbar">
+    <div class="topbar-left">
+      <span class="topbar-brand">NobarSync</span>
+      <span class="topbar-code" id="topbar-code" title="Tap untuk copy" onclick="copyCode()">
+        ------
+      </span>
+    </div>
+    <div class="topbar-right">
+      <div class="viewers-badge" id="viewers-badge">0 penonton</div>
+      <button class="btn-icon" title="Toggle chat" onclick="toggleChat()">💬</button>
+    </div>
+  </div>
+
+  <!-- Body: video + chat -->
+  <div class="watch-body">
+
+    <!-- Video side -->
+    <div class="video-side">
+      <div class="video-wrapper" id="video-wrapper"
+        onclick="handleVideoWrapperClick(event)"
+        ontouchstart="handleTouchStart(event)"
+        ontouchend="handleTouchEnd(event)">
+
+        <video id="video-player" preload="metadata" playsinline></video>
+
+        <!-- Placeholder -->
+        <div class="video-placeholder" id="video-placeholder">
+          <div class="vph-icon">🎬</div>
+          <div class="vph-text" id="placeholder-txt">Menunggu video...</div>
+        </div>
+
+        <!-- Center tap indicator -->
+        <div class="center-play" id="center-play">▶</div>
+
+        <!-- Controls overlay -->
+        <div class="video-overlay" id="video-overlay">
+          <div class="seek-row">
+            <input type="range" class="seek-bar" id="seek-bar"
+              min="0" max="100" step="0.1" value="0"
+              oninput="onSeekInput(this.value)"
+              onchange="onSeekChange(this.value)">
+            <span class="time-txt" id="time-display">0:00 / 0:00</span>
+          </div>
+          <div class="ctl-row">
+            <button class="vc-btn" id="btn-play-pause" onclick="togglePlayPause()" title="Play/Pause">▶</button>
+            <button class="vc-btn" onclick="skip(-10)" title="-10s">⏪</button>
+            <button class="vc-btn" onclick="skip(10)" title="+10s">⏩</button>
+            <input type="range" class="vol-slider" id="vol-slider"
+              min="0" max="1" step="0.05" value="1"
+              oninput="setVolume(this.value)">
+            <div class="spacer"></div>
+            <button class="vc-btn" onclick="toggleFullscreen()" title="Fullscreen">⛶</button>
+          </div>
+        </div>
+
+      </div><!-- /video-wrapper -->
+
+      <!-- Host bar -->
+      <div class="host-bar" id="host-bar" style="display:none">
+        <span class="host-badge">👑 Host</span>
+        <button class="change-vid-btn" onclick="openChangeVideoModal()">🎬 Ganti Video</button>
+        <div class="host-sep"></div>
+        <span class="ctrl-label">Penonton bisa kontrol:</span>
+        <label class="toggle" style="width:42px;height:22px">
+          <input type="checkbox" id="toggle-ctrl-live" onchange="updateViewerControlLive()">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+    </div><!-- /video-side -->
+
+    <!-- Chat sidebar -->
+    <div class="chat-side" id="chat-side">
+      <div class="chat-header">
+        <span class="chat-title">Live Chat</span>
+        <span class="viewers-badge" id="chat-viewers-badge">0</span>
+      </div>
+      <div class="chat-msgs" id="chat-msgs"></div>
+      <div class="chat-input-row">
+        <input class="chat-inp" id="chat-input" type="text"
+          placeholder="Tulis pesan..."
+          maxlength="200"
+          onkeydown="if(event.key==='Enter')sendChat()">
+        <button class="btn-icon" onclick="sendChat()" title="Kirim">➤</button>
+      </div>
+    </div>
+
+  </div><!-- /watch-body -->
+</div><!-- /screen-watch -->
+
+</body>
+</html>
