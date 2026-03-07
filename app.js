@@ -266,6 +266,9 @@ async function sendFileTo(conn) {
 
 function handleViewerData(conn, data) {
   switch (data.type) {
+    case 'request-sync':
+      handleViewerSync(conn);
+      break;
     case 'chat':
       broadcastData({ type: 'chat', name: data.name, text: data.text }, conn);
       addChatMsg({ name: data.name, text: data.text, mine: false, isHost: false });
@@ -411,6 +414,7 @@ function handleHostData(data) {
         showScreen('watch');
         setupWatchUI(false);
         updateControlsAccess();
+        document.getElementById('video-placeholder').style.display = 'none';
       }, { once: true });
       break;
     }
@@ -498,6 +502,7 @@ function viewerLoadUrl(url, currentTime, paused) {
     showScreen('watch');
     setupWatchUI(false);
     updateControlsAccess();
+    document.getElementById('video-placeholder').style.display = 'none';
     S.isSyncing = true;
     video.currentTime = currentTime || 0;
     S.isSyncing = false;
@@ -756,15 +761,4 @@ async function applyVideoChange() {
   }
 
   showToast('✅ Video berhasil diganti');
-}
-
-// Host handles viewer's request-sync
-// Hooked into the data handler
-const _origHandleViewerData = handleViewerData;
-function handleViewerData(conn, data) {
-  if (data.type === 'request-sync') {
-    handleViewerSync(conn);
-    return;
-  }
-  _origHandleViewerData(conn, data);
 }
