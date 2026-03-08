@@ -478,8 +478,12 @@ function handleHostData(data) {
       if (data.videoKind === 'url') {
         viewerLoadUrl(data.videoUrl, data.currentTime, data.paused);
       } else {
-        // file or file-blob: wait for stream-start / blob-start
-        showConnecting('Menerima video dari host...');
+        // Go to watch screen now, show buffer progress overlay on the video
+        hideConnecting();
+        showScreen('watch');
+        setupWatchUI(false);
+        updateControlsAccess();
+        showBufferingOverlay('Menunggu video dari host...');
       }
       break;
 
@@ -495,38 +499,31 @@ function handleHostData(data) {
 
     case 'stream-seg': {
       appendToTrack(data.trackId, data.data);
-      // Show progress and switch to watch screen once playable
       const pct = data.total ? Math.round((data.index / data.total) * 100) : 0;
-      document.getElementById('connecting-txt').textContent = `Buffering video... ${pct}%`;
-      // Move to watch screen as soon as we have a few seconds buffered
-      if (!document.getElementById('screen-watch').classList.contains('active')) {
-        const buffered = video.buffered;
-        if (buffered.length > 0 && buffered.end(0) >= 4) {
-          viewerEnterWatch();
-        }
+      updateBufferingOverlay(`Buffering... ${pct}%`);
+      // Auto-hide overlay and play once we have enough buffer
+      const buf = video.buffered;
+      if (buf.length > 0 && buf.end(0) >= 3) {
+        hideBufferingOverlay();
       }
       break;
     }
 
-    case 'stream-done':
-      // Signal end of stream to MSE
+    case 'stream-done': {
       const finalize = () => {
         if (S.mediaSource && S.mediaSource.readyState === 'open') {
           try { S.mediaSource.endOfStream(); } catch (e) {}
         }
       };
-      // Wait for any pending appends to finish
       const activeSBs = Object.values(S.trackSBs).filter(sb => sb.updating);
       if (activeSBs.length > 0) {
         activeSBs[0].addEventListener('updateend', finalize, { once: true });
       } else {
         finalize();
       }
-      // Ensure we're on watch screen
-      if (!document.getElementById('screen-watch').classList.contains('active')) {
-        viewerEnterWatch();
-      }
+      hideBufferingOverlay();
       break;
+    }
 
     // ── BLOB FALLBACK PATH ──
 
@@ -535,14 +532,13 @@ function handleHostData(data) {
       rxTotal = data.total;
       rxReceived = 0;
       rxMime = data.mime;
-      showConnecting('Mengunduh video... 0%');
+      updateBufferingOverlay('Mengunduh video... 0%');
       break;
 
     case 'blob-chunk':
       rxChunks[data.index] = data.data;
       rxReceived++;
-      document.getElementById('connecting-txt').textContent =
-        `Mengunduh video... ${Math.round(rxReceived / rxTotal * 100)}%`;
+      updateBufferingOverlay(`Mengunduh video... ${Math.round(rxReceived / rxTotal * 100)}%`);
       break;
 
     case 'blob-end': {
@@ -550,7 +546,7 @@ function handleHostData(data) {
       video.src = URL.createObjectURL(blob);
       video.load();
       video.addEventListener('canplay', () => {
-        viewerEnterWatch();
+        hideBufferingOverlay();
         document.getElementById('video-placeholder').style.display = 'none';
         S.hostDataConn.send({ type: 'request-sync' });
       }, { once: true });
@@ -622,7 +618,7 @@ function handleHostData(data) {
       if (data.videoKind === 'url') {
         viewerLoadUrl(data.videoUrl, 0, true);
       } else {
-        showConnecting('Menerima video baru...');
+        showBufferingOverlay('Menerima video baru...');
       }
       break;
   }
@@ -709,13 +705,42 @@ function viewerLoadUrl(url, currentTime, paused) {
 }
 
 function viewerEnterWatch() {
-  hideConnecting();
-  showScreen('watch');
-  setupWatchUI(false);
-  updateControlsAccess();
+  // Screen is already shown at init time; just sync playback position
   document.getElementById('video-placeholder').style.display = 'none';
-  // Request current time from host to sync up
   S.hostDataConn?.send({ type: 'request-sync' });
+}
+
+// Buffering overlay (shown over the video element while data is incoming)
+function showBufferingOverlay(msg) {
+  let el = document.getElementById('buffering-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'buffering-overlay';
+    el.style.cssText = `
+      position:absolute;inset:0;display:flex;flex-direction:column;
+      align-items:center;justify-content:center;
+      background:rgba(0,0,0,.65);z-index:20;border-radius:inherit;
+      font-family:var(--font-body,sans-serif);color:#fff;gap:12px;
+    `;
+    el.innerHTML = `
+      <div class="spinner" style="width:36px;height:36px;border:3px solid rgba(255,255,255,.2);border-top-color:var(--gold,#c89030);border-radius:50%;animation:spin .8s linear infinite"></div>
+      <span id="buffering-txt" style="font-size:.9rem;opacity:.9"></span>
+    `;
+    document.getElementById('video-wrapper').appendChild(el);
+  }
+  document.getElementById('buffering-txt').textContent = msg;
+  el.style.display = 'flex';
+}
+
+function updateBufferingOverlay(msg) {
+  const el = document.getElementById('buffering-overlay');
+  if (el) document.getElementById('buffering-txt').textContent = msg;
+  else showBufferingOverlay(msg);
+}
+
+function hideBufferingOverlay() {
+  const el = document.getElementById('buffering-overlay');
+  if (el) el.style.display = 'none';
 }
 
 // ── WATCH UI ─────────────────────────────────
