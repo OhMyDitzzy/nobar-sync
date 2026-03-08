@@ -11,20 +11,23 @@ const S = {
   pendingModalFile: null,
   modalTab: 'url',
   controlTimer: null,
-  // video source (host stores these to send to late-joining viewers)
+  // host video source
   videoKind: null,   // 'url' | 'file'
   videoUrl: null,
+  // mp4box fragmented segments: { trackId: { mime, initSeg, segments[] } }
+  streamTrackInfo: null,
+  // fallback blob (non-mp4 or mp4box failure)
   fileBuffer: null,
   fileMime: '',
-  fileName: '',
-  // viewer file reception
-  rxChunks: [],
-  rxTotal: 0,
-  rxReceived: 0,
+  // viewer MSE state
+  mediaSource: null,
+  trackSBs: {},    // trackId -> SourceBuffer
+  trackQueues: {}, // trackId -> ArrayBuffer[]
+  totalTracks: 0,
+  tracksReady: 0,
 };
 
 const video = document.getElementById('video-player');
-const CHUNK_SIZE = 65536; // 64 KB per chunk
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-file-input').addEventListener('change', (e) => {
@@ -34,11 +37,9 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('modal-file-name').textContent = '✔ ' + f.name;
     }
   });
-
   document.getElementById('modal-change-video').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeModal();
   });
-
   const setupZone = document.getElementById('setup-file-zone');
   ['dragover', 'dragenter'].forEach(ev =>
     setupZone.addEventListener(ev, e => { e.preventDefault(); setupZone.classList.add('drag-over'); })
@@ -61,8 +62,7 @@ function genCode() {
 
 function fmtTime(s) {
   if (!s || isNaN(s) || !isFinite(s)) return '0:00';
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
   return `${m}:${sec.toString().padStart(2, '0')}`;
 }
 
@@ -79,7 +79,6 @@ function showConnecting(msg = 'Menghubungkan...') {
   document.getElementById('connecting-txt').textContent = msg;
   document.getElementById('connecting').classList.remove('hidden');
 }
-
 function hideConnecting() {
   document.getElementById('connecting').classList.add('hidden');
 }
@@ -135,13 +134,11 @@ function initHostPeer(code, urlVal, hasFile) {
 
   S.peer.on('open', async (id) => {
     S.roomCode = id;
-
     if (hasFile && S.pendingFile) {
       await hostLoadFile(S.pendingFile);
     } else if (urlVal) {
       await hostLoadUrl(urlVal);
     }
-
     hideConnecting();
     showScreen('watch');
     setupWatchUI(true);
@@ -159,14 +156,33 @@ function initHostPeer(code, urlVal, hasFile) {
   S.peer.on('connection', (conn) => handleNewViewer(conn));
 }
 
+// ── HOST: VIDEO LOADING ──────────────────────
+
 async function hostLoadFile(file) {
   showConnecting('Membaca file...');
   S.videoKind = 'file';
   S.fileMime = file.type || 'video/mp4';
-  S.fileName = file.name;
-  S.fileBuffer = await file.arrayBuffer();
 
-  const blob = new Blob([S.fileBuffer], { type: S.fileMime });
+  const buffer = await file.arrayBuffer();
+
+  const isMP4 = S.fileMime.includes('mp4') || file.name.match(/\.(mp4|m4v)$/i);
+  const hasMp4Box = typeof MP4Box !== 'undefined';
+
+  if (isMP4 && hasMp4Box) {
+    showConnecting('Memproses video untuk streaming...');
+    const ok = await fragmentWithMp4box(buffer);
+    if (!ok) {
+      // mp4box failed, fall back to blob transfer
+      S.videoKind = 'file-blob';
+      S.fileBuffer = buffer;
+    }
+  } else {
+    S.videoKind = 'file-blob';
+    S.fileBuffer = buffer;
+  }
+
+  // Load for host playback
+  const blob = new Blob([buffer], { type: S.fileMime });
   video.src = URL.createObjectURL(blob);
   video.srcObject = null;
   await waitForMetadata();
@@ -198,13 +214,66 @@ function waitForMetadata() {
   });
 }
 
+// Fragment MP4 using mp4box.js → stores track info in S.streamTrackInfo
+function fragmentWithMp4box(buffer) {
+  return new Promise((resolve) => {
+    const mp4boxFile = MP4Box.createFile();
+    const trackInfo = {};
+    let totalTracks = 0;
+    let doneTracks = 0;
+    let started = false;
+
+    mp4boxFile.onReady = (info) => {
+      const allTracks = [...(info.videoTracks || []), ...(info.audioTracks || [])];
+      totalTracks = allTracks.length;
+
+      if (totalTracks === 0) { resolve(false); return; }
+
+      allTracks.forEach(track => {
+        const isVideo = (info.videoTracks || []).some(t => t.id === track.id);
+        const mime = `${isVideo ? 'video' : 'audio'}/mp4; codecs="${track.codec}"`;
+        trackInfo[track.id] = { mime, initSeg: null, segments: [] };
+        mp4boxFile.setSegmentOptions(track.id, null, { nbSamples: 100 });
+      });
+
+      const initSegs = mp4boxFile.initializeSegmentation();
+      initSegs.forEach(seg => {
+        if (trackInfo[seg.id]) trackInfo[seg.id].initSeg = seg.buffer.slice(0);
+      });
+
+      S.streamTrackInfo = trackInfo;
+      started = true;
+      mp4boxFile.start();
+    };
+
+    mp4boxFile.onSegment = (id, user, segBuffer, sampleNum, isLast) => {
+      if (trackInfo[id]) {
+        trackInfo[id].segments.push(segBuffer.slice(0));
+      }
+      if (isLast) {
+        doneTracks++;
+        if (doneTracks >= totalTracks) resolve(true);
+      }
+    };
+
+    mp4boxFile.onError = () => resolve(false);
+
+    // Fallback: resolve after 60s
+    setTimeout(() => { if (!started || doneTracks < totalTracks) resolve(!!started); }, 60000);
+
+    const ab = buffer.slice(0);
+    ab.fileStart = 0;
+    mp4boxFile.appendBuffer(ab);
+    mp4boxFile.flush();
+  });
+}
+
 // ── HOST: VIEWER MANAGEMENT ──────────────────
 
 function handleNewViewer(conn) {
   S.connections.push(conn);
 
   conn.on('open', () => {
-    // Send initial state
     conn.send({
       type: 'init',
       allowViewerControl: S.allowViewerControl,
@@ -214,18 +283,18 @@ function handleNewViewer(conn) {
       videoKind: S.videoKind,
       videoUrl: S.videoKind === 'url' ? S.videoUrl : null,
       fileMime: S.fileMime,
-      fileName: S.fileName,
     });
 
-    // If file-based, transfer the file to this viewer
-    if (S.videoKind === 'file' && S.fileBuffer) {
-      sendFileTo(conn);
+    if (S.videoKind === 'file') {
+      streamFileTo(conn);
+    } else if (S.videoKind === 'file-blob') {
+      sendBlobTo(conn);
     }
 
     const name = conn.metadata?.name || 'Penonton';
-    const sysMsg = `${name} bergabung 👋`;
-    broadcastData({ type: 'sys', msg: sysMsg }, conn);
-    addSysMsg(sysMsg);
+    const msg = `${name} bergabung 👋`;
+    broadcastData({ type: 'sys', msg }, conn);
+    addSysMsg(msg);
     updateViewerBadge(S.connections.length);
   });
 
@@ -246,28 +315,64 @@ function handleNewViewer(conn) {
   });
 }
 
-// Send file in chunks to a specific connection
-async function sendFileTo(conn) {
-  const buf = S.fileBuffer;
-  const total = Math.ceil(buf.byteLength / CHUNK_SIZE);
+// Stream fragmented MP4 segments to viewer
+async function streamFileTo(conn) {
+  const trackInfo = S.streamTrackInfo;
+  if (!trackInfo) return;
 
-  conn.send({ type: 'file-start', total, mime: S.fileMime, name: S.fileName });
+  // Tell viewer which tracks exist and their MIME types
+  const trackMimes = {};
+  for (const [id, info] of Object.entries(trackInfo)) {
+    trackMimes[id] = info.mime;
+  }
+  conn.send({ type: 'stream-start', trackMimes });
 
-  for (let i = 0; i < total; i++) {
-    if (!conn.open) break;
-    const chunk = buf.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-    conn.send({ type: 'file-chunk', index: i, data: chunk });
-    // Yield every 20 chunks to avoid overwhelming the data channel
-    if (i % 20 === 19) await new Promise(r => setTimeout(r, 15));
+  // Send init segments for each track
+  for (const [id, info] of Object.entries(trackInfo)) {
+    if (info.initSeg) {
+      conn.send({ type: 'stream-init', trackId: Number(id), data: info.initSeg });
+    }
   }
 
-  conn.send({ type: 'file-end' });
+  // Interleave segments by index so viewer buffers audio+video together
+  const trackIds = Object.keys(trackInfo);
+  const maxSegs = Math.max(...trackIds.map(id => trackInfo[id].segments.length));
+
+  for (let i = 0; i < maxSegs; i++) {
+    if (!conn.open) break;
+    for (const id of trackIds) {
+      const seg = trackInfo[id].segments[i];
+      if (seg) {
+        const isLast = i === trackInfo[id].segments.length - 1;
+        conn.send({ type: 'stream-seg', trackId: Number(id), index: i, total: trackInfo[id].segments.length, data: seg });
+      }
+    }
+    // Yield every 10 rounds to avoid flooding the data channel
+    if (i % 10 === 9) await new Promise(r => setTimeout(r, 16));
+  }
+
+  conn.send({ type: 'stream-done' });
+}
+
+// Fallback: send raw file as blob chunks (for non-MP4 or when mp4box fails)
+async function sendBlobTo(conn) {
+  const CHUNK = 65536;
+  const buf = S.fileBuffer;
+  if (!buf) return;
+  const total = Math.ceil(buf.byteLength / CHUNK);
+  conn.send({ type: 'blob-start', total, mime: S.fileMime });
+  for (let i = 0; i < total; i++) {
+    if (!conn.open) break;
+    conn.send({ type: 'blob-chunk', index: i, data: buf.slice(i * CHUNK, (i + 1) * CHUNK) });
+    if (i % 20 === 19) await new Promise(r => setTimeout(r, 15));
+  }
+  conn.send({ type: 'blob-end' });
 }
 
 function handleViewerData(conn, data) {
   switch (data.type) {
     case 'request-sync':
-      handleViewerSync(conn);
+      conn.send({ type: 'sync', currentTime: video.currentTime, paused: video.paused });
       break;
     case 'chat':
       broadcastData({ type: 'chat', name: data.name, text: data.text }, conn);
@@ -279,7 +384,6 @@ function handleViewerData(conn, data) {
         video.currentTime = data.time;
         broadcastData({ type: 'play', time: data.time }, conn);
         video.play().catch(() => {});
-        // Clear isSyncing after 'play' event has fired (event listener runs before ours)
         video.addEventListener('play', () => { S.isSyncing = false; }, { once: true });
       }
       break;
@@ -332,13 +436,8 @@ function joinRoom() {
 
   S.peer.on('open', () => {
     S.hostDataConn = S.peer.connect(code, { metadata: { name }, reliable: true });
-
-    S.hostDataConn.on('open', () => {
-      // Connection open, waiting for 'init' from host
-    });
-
+    S.hostDataConn.on('open', () => { /* waiting for 'init' */ });
     S.hostDataConn.on('data', handleHostData);
-
     S.hostDataConn.on('close', () => showToast('❌ Host memutus koneksi'));
     S.hostDataConn.on('error', (e) => {
       hideConnecting();
@@ -346,8 +445,7 @@ function joinRoom() {
     });
 
     setTimeout(() => {
-      if (document.getElementById('screen-watch').style.display === 'none' ||
-          !document.getElementById('screen-watch').classList.contains('active')) {
+      if (!document.getElementById('screen-watch').classList.contains('active')) {
         hideConnecting();
         showToast('⏱ Timeout. Periksa kode room.');
         showScreen('join');
@@ -357,77 +455,109 @@ function joinRoom() {
 
   S.peer.on('error', (err) => {
     hideConnecting();
-    if (err.type === 'peer-unavailable') {
-      showToast('❌ Room tidak ditemukan: ' + code);
-    } else {
-      showToast('❌ ' + err.message);
-    }
+    showToast(err.type === 'peer-unavailable'
+      ? '❌ Room tidak ditemukan: ' + code
+      : '❌ ' + err.message
+    );
     showScreen('join');
   });
 }
 
 // ── VIEWER: HANDLE HOST DATA ─────────────────
 
+// Viewer blob receive state
+let rxChunks = [], rxTotal = 0, rxReceived = 0, rxMime = '';
+
 function handleHostData(data) {
   switch (data.type) {
+
     case 'init':
       S.allowViewerControl = data.allowViewerControl;
       S.roomCode = data.roomCode;
       document.getElementById('topbar-code').textContent = data.roomCode || '------';
-
       if (data.videoKind === 'url') {
-        // Load URL directly — same as host
         viewerLoadUrl(data.videoUrl, data.currentTime, data.paused);
-      } else if (data.videoKind === 'file') {
-        // File will arrive via file-start/chunk/end messages
-        showConnecting('Menerima video dari host...');
-        S.rxChunks = [];
-        S.rxTotal = 0;
-        S.rxReceived = 0;
-      }
-      break;
-
-    case 'file-start':
-      S.rxChunks = new Array(data.total);
-      S.rxTotal = data.total;
-      S.rxReceived = 0;
-      S.fileMime = data.mime;
-      document.getElementById('connecting-txt').textContent =
-        `Menerima video... 0%`;
-      break;
-
-    case 'file-chunk':
-      S.rxChunks[data.index] = data.data;
-      S.rxReceived++;
-      const pct = Math.round((S.rxReceived / S.rxTotal) * 100);
-      document.getElementById('connecting-txt').textContent =
-        `Menerima video... ${pct}%`;
-      break;
-
-    case 'file-end': {
-      const blob = new Blob(S.rxChunks, { type: S.fileMime });
-      const blobUrl = URL.createObjectURL(blob);
-      video.src = blobUrl;
-      video.load();
-
-      hideConnecting();
-      showScreen('watch');
-      setupWatchUI(false);
-      updateControlsAccess();
-
-      function onFileReady() {
-        document.getElementById('video-placeholder').style.display = 'none';
-        S.hostDataConn.send({ type: 'request-sync' });
-      }
-
-      if (video.readyState >= 3) {
-        onFileReady();
       } else {
-        video.addEventListener('canplay', onFileReady, { once: true });
-        video.addEventListener('loadeddata', onFileReady, { once: true });
+        // file or file-blob: wait for stream-start / blob-start
+        showConnecting('Menerima video dari host...');
+      }
+      break;
+
+    // ── MSE STREAMING PATH ──
+
+    case 'stream-start':
+      viewerSetupMSE(data.trackMimes);
+      break;
+
+    case 'stream-init':
+      appendToTrack(data.trackId, data.data);
+      break;
+
+    case 'stream-seg': {
+      appendToTrack(data.trackId, data.data);
+      // Show progress and switch to watch screen once playable
+      const pct = data.total ? Math.round((data.index / data.total) * 100) : 0;
+      document.getElementById('connecting-txt').textContent = `Buffering video... ${pct}%`;
+      // Move to watch screen as soon as we have a few seconds buffered
+      if (!document.getElementById('screen-watch').classList.contains('active')) {
+        const buffered = video.buffered;
+        if (buffered.length > 0 && buffered.end(0) >= 4) {
+          viewerEnterWatch();
+        }
       }
       break;
     }
+
+    case 'stream-done':
+      // Signal end of stream to MSE
+      const finalize = () => {
+        if (S.mediaSource && S.mediaSource.readyState === 'open') {
+          try { S.mediaSource.endOfStream(); } catch (e) {}
+        }
+      };
+      // Wait for any pending appends to finish
+      const activeSBs = Object.values(S.trackSBs).filter(sb => sb.updating);
+      if (activeSBs.length > 0) {
+        activeSBs[0].addEventListener('updateend', finalize, { once: true });
+      } else {
+        finalize();
+      }
+      // Ensure we're on watch screen
+      if (!document.getElementById('screen-watch').classList.contains('active')) {
+        viewerEnterWatch();
+      }
+      break;
+
+    // ── BLOB FALLBACK PATH ──
+
+    case 'blob-start':
+      rxChunks = new Array(data.total);
+      rxTotal = data.total;
+      rxReceived = 0;
+      rxMime = data.mime;
+      showConnecting('Mengunduh video... 0%');
+      break;
+
+    case 'blob-chunk':
+      rxChunks[data.index] = data.data;
+      rxReceived++;
+      document.getElementById('connecting-txt').textContent =
+        `Mengunduh video... ${Math.round(rxReceived / rxTotal * 100)}%`;
+      break;
+
+    case 'blob-end': {
+      const blob = new Blob(rxChunks, { type: rxMime });
+      video.src = URL.createObjectURL(blob);
+      video.load();
+      video.addEventListener('canplay', () => {
+        viewerEnterWatch();
+        document.getElementById('video-placeholder').style.display = 'none';
+        S.hostDataConn.send({ type: 'request-sync' });
+      }, { once: true });
+      break;
+    }
+
+    // ── SYNC & PLAYBACK ──
 
     case 'sync':
       S.isSyncing = true;
@@ -484,41 +614,82 @@ function handleHostData(data) {
       break;
 
     case 'video-change':
-      // Host changed the video entirely
       addSysMsg('🎬 Host mengganti video...');
+      // Reset MSE state
+      S.mediaSource = null;
+      S.trackSBs = {};
+      S.trackQueues = {};
       if (data.videoKind === 'url') {
         viewerLoadUrl(data.videoUrl, 0, true);
       } else {
         showConnecting('Menerima video baru...');
-        S.rxChunks = [];
-        S.rxTotal = 0;
-        S.rxReceived = 0;
       }
       break;
   }
 }
 
-// Host responds to viewer's request-sync
-function handleViewerSync(conn) {
-  conn.send({
-    type: 'sync',
-    currentTime: video.currentTime,
-    paused: video.paused,
-  });
+// Viewer: set up MediaSource with separate SourceBuffers per track
+function viewerSetupMSE(trackMimes) {
+  // trackMimes: { "1": "video/mp4; codecs=...", "2": "audio/mp4; codecs=..." }
+  const ms = new MediaSource();
+  S.mediaSource = ms;
+  S.trackSBs = {};
+  S.trackQueues = {};
+  S.totalTracks = Object.keys(trackMimes).length;
+  S.tracksReady = 0;
+
+  video.src = URL.createObjectURL(ms);
+
+  ms.addEventListener('sourceopen', () => {
+    for (const [trackId, mime] of Object.entries(trackMimes)) {
+      if (!MediaSource.isTypeSupported(mime)) {
+        console.warn('Unsupported MIME:', mime);
+        continue;
+      }
+      try {
+        const sb = ms.addSourceBuffer(mime);
+        S.trackSBs[trackId] = sb;
+        S.trackQueues[trackId] = [];
+        sb.addEventListener('updateend', () => drainTrackQueue(trackId));
+      } catch (e) {
+        console.warn('addSourceBuffer failed:', mime, e);
+      }
+    }
+    // Drain any data that arrived before sourceopen
+    for (const trackId of Object.keys(S.trackSBs)) {
+      drainTrackQueue(trackId);
+    }
+  }, { once: true });
+}
+
+function appendToTrack(trackId, buffer) {
+  const id = String(trackId);
+  if (!S.trackQueues[id]) S.trackQueues[id] = [];
+  S.trackQueues[id].push(buffer);
+  drainTrackQueue(id);
+}
+
+function drainTrackQueue(trackId) {
+  const sb = S.trackSBs[trackId];
+  const q = S.trackQueues[trackId];
+  if (!sb || !q || q.length === 0 || sb.updating) return;
+  if (!S.mediaSource || S.mediaSource.readyState !== 'open') return;
+  try {
+    sb.appendBuffer(q.shift());
+  } catch (e) {
+    console.warn('appendBuffer error:', e);
+  }
 }
 
 function viewerLoadUrl(url, currentTime, paused) {
   video.src = url;
   video.load();
-
-  // Go to watch screen immediately — don't wait for canplay
-  // because host may send play/pause before it fires
   hideConnecting();
   showScreen('watch');
   setupWatchUI(false);
   updateControlsAccess();
 
-  function onReady() {
+  const onReady = () => {
     document.getElementById('video-placeholder').style.display = 'none';
     S.isSyncing = true;
     video.currentTime = currentTime || 0;
@@ -528,33 +699,36 @@ function viewerLoadUrl(url, currentTime, paused) {
     } else {
       video.addEventListener('seeked', () => { S.isSyncing = false; }, { once: true });
     }
-  }
+  };
 
-  // Fire as soon as we have enough data; fall back to loadeddata
   if (video.readyState >= 3) {
     onReady();
   } else {
     video.addEventListener('canplay', onReady, { once: true });
-    video.addEventListener('loadeddata', onReady, { once: true });
   }
 }
 
-// ── WATCH SCREEN SETUP ───────────────────────
+function viewerEnterWatch() {
+  hideConnecting();
+  showScreen('watch');
+  setupWatchUI(false);
+  updateControlsAccess();
+  document.getElementById('video-placeholder').style.display = 'none';
+  // Request current time from host to sync up
+  S.hostDataConn?.send({ type: 'request-sync' });
+}
+
+// ── WATCH UI ─────────────────────────────────
 
 function setupWatchUI(isHost) {
   document.getElementById('topbar-code').textContent = S.roomCode || '------';
   document.getElementById('host-bar').style.display = isHost ? 'flex' : 'none';
   document.getElementById('toggle-ctrl-live').checked = S.allowViewerControl;
-
   if (isHost) updateViewerBadge(0);
-
   setupVideoEvents();
   updateControlsAccess();
   showControlsFor(3000);
-  addSysMsg(isHost
-    ? '🎬 Room dibuat. Bagikan kode ke teman!'
-    : '👋 Bergabung ke room ' + S.roomCode
-  );
+  addSysMsg(isHost ? '🎬 Room dibuat. Bagikan kode ke teman!' : '👋 Bergabung ke room ' + S.roomCode);
 }
 
 function updateControlsAccess() {
@@ -647,8 +821,7 @@ function skip(sec) {
 function onSeekInput(val) {
   if (!S.isHost && !S.allowViewerControl) return;
   const t = (val / 100) * (video.duration || 0);
-  document.getElementById('time-display').textContent =
-    fmtTime(t) + ' / ' + fmtTime(video.duration);
+  document.getElementById('time-display').textContent = fmtTime(t) + ' / ' + fmtTime(video.duration);
 }
 
 function onSeekChange(val) {
@@ -745,7 +918,7 @@ function toggleChat() {
   chat.style.display = chat.style.display === 'none' ? '' : 'none';
 }
 
-// ── CHANGE VIDEO MODAL (HOST) ────────────────
+// ── CHANGE VIDEO MODAL ───────────────────────
 
 function openChangeVideoModal() {
   document.getElementById('modal-change-video').classList.remove('hidden');
@@ -779,10 +952,11 @@ async function applyVideoChange() {
   } else if (S.pendingModalFile) {
     await hostLoadFile(S.pendingModalFile);
     S.pendingModalFile = null;
-    // Send new file to all connected viewers
-    broadcastData({ type: 'video-change', videoKind: 'file' });
+    broadcastData({ type: 'video-change', videoKind: S.videoKind });
     for (const conn of S.connections) {
-      if (conn.open) sendFileTo(conn);
+      if (!conn.open) continue;
+      if (S.videoKind === 'file') streamFileTo(conn);
+      else if (S.videoKind === 'file-blob') sendBlobTo(conn);
     }
   } else {
     showToast('⚠️ Pilih file terlebih dahulu');
